@@ -7,8 +7,8 @@ android {
     compileSdk 34
 
     defaultConfig {
-        namespace "com.mikepenz.gradleexample"
-        applicationId "com.mikepenz.gradleexample"
+        namespace "com.stepsecurity.gradleexample"
+        applicationId "com.stepsecurity.gradleexample"
         minSdk 29
         targetSdk 34
         versionCode 1

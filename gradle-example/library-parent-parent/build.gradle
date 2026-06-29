@@ -11,7 +11,7 @@ android {
         versionCode 1
         versionName "1.0"
 
-        namespace "com.mikepenz.gradleexample.libparentparent"
+        namespace "com.stepsecurity.gradleexample.libparentparent"
     }
 }
 

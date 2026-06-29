@@ -1,6 +1,6 @@
 name: 'Gradle Dependency Submission'
 description: 'Calculates dependencies for a Gradle build-target and submits the list to the Dependency Submission API'
-author: 'Mike Penz'
+author: 'step-security'
 branding:
   icon: 'check-circle'  
   color: 'blue'
@@ -52,5 +52,5 @@ inputs:
     description: 'Enables support for gradle versions below 7.5. Note: If enabled, all properties are read by the action as `--property` was only introduced in Gradle 7.5 or newer.'
     default: 'false'
 runs:
-  using: 'node20'
+  using: 'node24'
   main: 'dist/index.js'

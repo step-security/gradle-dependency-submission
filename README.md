@@ -1,8 +1,5 @@
 [![StepSecurity Maintained Action](https://raw.githubusercontent.com/step-security/maintained-actions-assets/main/assets/maintained-action-banner.png)](https://docs.stepsecurity.io/actions/stepsecurity-maintained-actions)
 
-> [!IMPORTANT]  
-> With the introduction of support for the `Dependency Submission API` into the official [Gradle Build Action](https://github.com/gradle/gradle-build-action?tab=readme-ov-file#github-dependency-graph-support) this project is officially deprecated. 
-> Please consider using the [Gradle Build Action](https://github.com/gradle/gradle-build-action?tab=readme-ov-file#github-dependency-graph-support) for new projects.
 
 -------
 
@@ -60,10 +57,10 @@ jobs:
       contents: write
     steps:
       - name: 'Checkout Repository'
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
 
       - name: Run snapshot action
-        uses: step-security/gradle-dependency-submission@{latest}
+        uses: step-security/gradle-dependency-submission@v1
         with:
           gradle-project-path: "gradle-example"
           gradle-build-module: ":app"
@@ -76,7 +73,7 @@ The following example showcases a gradle module in the root, without a module na
 
 ```yml
 - name: Root Gradle Dependency Submission
-  uses: step-security/gradle-dependency-submission@{latest}
+  uses: step-security/gradle-dependency-submission@v1
   with:
     use-gradlew: false
     gradle-build-module: |-
@@ -93,7 +90,7 @@ The following example showcases a gradle module in the root, without a module na
 
 ```yml
 - name: Gradle Dependency Submission
-  uses: step-security/gradle-dependency-submission@{latest}
+  uses: step-security/gradle-dependency-submission@v1
   with:
     gradle-project-path: |-
       gradle-example
@@ -136,37 +133,10 @@ The following example showcases a gradle module in the root, without a module na
 
 [Snapshot dependencies](https://github.com/step-security/gradle-dependency-submission/network/dependencies)
 
-## Contribute 🧬
-
-```bash
-# Install the dependencies  
-$ npm install
-
-# Verify lint is happy
-$ npm run lint -- --fix
-
-# Build the typescript and package it for distribution
-$ npm run build && npm run package
-
-# Run the tests, use to debug, and test it out
-$ npm test
-```
-
-### Credits
-
-- [Go Dependency Submission Action](https://github.com/actions/go-dependency-submission/)
-- [Dependency Submission Toolkit](https://github.com/github/dependency-submission-toolkit)
-
-## Other actions
-
-- [release-changelog-builder-action](https://github.com/mikepenz/release-changelog-builder-action)
-- [action-junit-report](https://github.com/mikepenz/action-junit-report)
-- [xray-action](https://github.com/mikepenz/xray-action/)
-- [jira-release-composition-action](https://github.com/mikepenz/jira-release-composite-action)
-
 ## License
 
     Copyright (C) 2022 Mike Penz
+    Copyright (c) 2026 StepSecurity
 
     Licensed under the Apache License, Version 2.0 (the "License");
     you may not use this file except in compliance with the License.
