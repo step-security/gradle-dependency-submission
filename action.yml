@@ -1,0 +1,56 @@
+name: 'Gradle Dependency Submission'
+description: 'Calculates dependencies for a Gradle build-target and submits the list to the Dependency Submission API'
+author: 'Mike Penz'
+branding:
+  icon: 'check-circle'  
+  color: 'blue'
+inputs:
+  token:
+    description: "GitHub Personal Access Token (PAT). Defaults to PAT provided by Action runner"
+    required: false
+    default: ${{ github.token }}
+  use-gradlew:
+    required: true
+    description: 'Describes if the action will use `./gradlew` to retrieve the dependencies. Alternative `gradle`'
+    default: 'true'
+  gradle-project-path:
+    required: true
+    description: 'Path to the root of the project to extract dependencies for'
+    default: ''
+  gradle-build-module:
+    required: true
+    description: 'The module for which to resolve dependencies. E.g. `:app`'
+    default: ''
+  gradle-build-configuration:
+    required: true
+    description: 'The configuration used to retrieve all dependencies from. Java projects usually use `compileClasspath`'
+    default: ''
+  gradle-build-configuration-mapping:
+    required: false
+    description: 'Optional module based configuration mapping. This is a multi line input whereas each line can contain mappings in the format of: `:module-name|configurationName`'
+  gradle-dependency-path:
+    required: false
+    description: 'Path to the file containing the dependency specification. Relative to the provided project-path. By default it will retrieve this via gradle.'
+  sub-module-mode:
+    required: false
+    description: 'Defines how the action handles submodules (sub projects). "IGNORE", "COMBINED", "INDIVIDUAL". Default: "IGNORE"'
+    default: 'IGNORE'
+  include-build-environment:
+    required: false
+    description: 'Optional mode to also submit the `buildEnvironment` to the dependency submission API. This will execute the `buildEnvironment` task on the root module.'
+    default: 'false'
+  fail-on-error:
+    required: false
+    description: 'Optional setting to enable an action failure in case any of the dependencies can not be parsed. Default: `false`.'
+    default: 'false'
+  correlator:
+    required: false
+    description: 'Optional correlator string to submit to GitHub to identify the dependency submission.  Defaults to generating based on gradle-build-module and gradle-build-configuration.'
+    default: ''
+  legacy-support:
+    required: false
+    description: 'Enables support for gradle versions below 7.5. Note: If enabled, all properties are read by the action as `--property` was only introduced in Gradle 7.5 or newer.'
+    default: 'false'
+runs:
+  using: 'node20'
+  main: 'dist/index.js'
