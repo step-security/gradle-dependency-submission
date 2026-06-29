@@ -20,8 +20,6 @@
 <p align="center">
     <a href="#whats-included-">What's included 🚀</a> &bull;
     <a href="#setup">Setup 🛠️</a> &bull;
-    <a href="#sample-%EF%B8%8F">Sample 🖥️</a> &bull;
-    <a href="#contribute-">Contribute 🧬</a> &bull;
     <a href="#license">License 📓</a>
 </p>
 
@@ -128,10 +126,6 @@ The following example showcases a gradle module in the root, without a module na
 | `COMBINED`    | Combines and flattens the sub dependencies, and attaches them to the root of the parent module. |
 | `INDIVIDUAL`  | Handles every single module as its own `Manifest` in the dependency submission API. Uses the gradle API to retrieve the module paths, and imports them individually. |
 | `INDIVIDUAL_DEEP`  | Handles every single module as its own `Manifest` in the dependency submission API. Will call the `dependencies` task for every single sub project/module to gather the full tree. Uses the gradle API to retrieve the module paths, and imports them individually. |
-
-## Sample 🖥️
-
-[Snapshot dependencies](https://github.com/step-security/gradle-dependency-submission/network/dependencies)
 
 ## License
 
