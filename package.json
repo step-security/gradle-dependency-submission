@@ -25,7 +25,7 @@
   "author": "step-security",
   "license": "Apache 2.0",
   "dependencies": {
-    "@actions/core": "^2.0.0",
+    "@actions/core": "^3.0.1",
     "@actions/exec": "^2.0.0",
     "@github/dependency-submission-toolkit": "^2.0.3",
     "axios": "^1.18.0",
