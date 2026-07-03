@@ -1,0 +1,18 @@
+{
+   "schema_version": "1",
+   "onboarding_type": "copied",
+   "archived": true,
+   "maintained_action_name": "step-security/gradle-dependency-submission",
+   "upstream_full_repo_name": "mikepenz/gradle-dependency-submission",
+   "action_type": "node",
+   "last_release": {
+     "tag_name": "v1.0.0",
+     "created_at": "2026-07-01T05:46:24Z",
+     "published_at": "2026-07-01T14:35:31Z"
+   },
+   "sync": {
+     "ignore_presets": [
+       "defaults_v1"
+     ]
+   }
+ }
