@@ -6183,7 +6183,13 @@ function processHeader (request, key, val) {
       } else if (typeof val[i] === 'object') {
         throw new InvalidArgumentError(`invalid ${key} header`)
       } else {
-        arr.push(`${val[i]}`)
+        // Coerce primitives (and reject unsafe coercions such as functions
+        // with a crafted toString/Symbol.toPrimitive).
+        const str = `${val[i]}`
+        if (!isValidHeaderValue(str)) {
+          throw new InvalidArgumentError(`invalid ${key} header`)
+        }
+        arr.push(str)
       }
     }
     val = arr
@@ -6194,7 +6200,12 @@ function processHeader (request, key, val) {
   } else if (val === null) {
     val = ''
   } else {
+    // Coerce primitives (and reject unsafe coercions such as functions
+    // with a crafted toString/Symbol.toPrimitive).
     val = `${val}`
+    if (!isValidHeaderValue(val)) {
+      throw new InvalidArgumentError(`invalid ${key} header`)
+    }
   }
 
   if (headerName === 'host') {
@@ -7571,6 +7582,7 @@ const {
   RequestContentLengthMismatchError,
   ResponseContentLengthMismatchError,
   RequestAbortedError,
+  InvalidArgumentError,
   HeadersTimeoutError,
   HeadersOverflowError,
   SocketError,
@@ -8554,8 +8566,16 @@ function writeH1 (client, request) {
     }
     body = bodyStream.stream
     contentLength = bodyStream.length
-  } else if (util.isBlobLike(body) && request.contentType == null && body.type) {
-    headers.push('content-type', body.type)
+  } else if (util.isBlobLike(body) && request.contentType == null) {
+    const contentType = body.type
+    if (contentType) {
+      const contentTypeValue = `${contentType}`
+      if (!util.isValidHeaderValue(contentTypeValue)) {
+        util.errorRequest(client, request, new InvalidArgumentError('invalid content-type header'))
+        return false
+      }
+      headers.push('content-type', contentTypeValue)
+    }
   }
 
   if (body && typeof body.read === 'function') {
@@ -12042,6 +12062,28 @@ function calculateRetryAfterHeader (retryAfter) {
   return new Date(retryAfter).getTime() - current
 }
 
+function validatePartialResponseContentLength (headers, range, statusCode, retryCount) {
+  const contentLength = headers['content-length']
+  if (contentLength == null) {
+    return null
+  }
+
+  if (!Number.isFinite(range.start) || !Number.isFinite(range.end)) {
+    return null
+  }
+
+  const length = Number(contentLength)
+  const expectedLength = range.end - range.start + 1
+  if (!Number.isFinite(length) || length !== expectedLength) {
+    return new RequestRetryError('Content-Length mismatch', statusCode, {
+      headers,
+      data: { count: retryCount }
+    })
+  }
+
+  return null
+}
+
 class RetryHandler {
   constructor (opts, handlers) {
     const { retryOptions, ...dispatchOpts } = opts
@@ -12256,6 +12298,12 @@ class RetryHandler {
         return false
       }
 
+      const contentLengthError = validatePartialResponseContentLength(headers, contentRange, statusCode, this.retryCount)
+      if (contentLengthError != null) {
+        this.abort(contentLengthError)
+        return false
+      }
+
       const { start, size, end = size - 1 } = contentRange
 
       assert(this.start === start, 'content-range mismatch')
@@ -12277,6 +12325,12 @@ class RetryHandler {
             resume,
             statusMessage
           )
+        }
+
+        const contentLengthError = validatePartialResponseContentLength(headers, range, statusCode, this.retryCount)
+        if (contentLengthError != null) {
+          this.abort(contentLengthError)
+          return false
         }
 
         const { start, size, end = size - 1 } = range
@@ -16550,7 +16604,7 @@ function validateCookiePath (path) {
 
     if (
       code < 0x20 || // exclude CTLs (0-31)
-      code === 0x7F || // DEL
+      code > 0x7E || // exclude DEL and non-ascii
       code === 0x3B // ;
     ) {
       throw new Error('Invalid cookie path')
@@ -16559,16 +16613,80 @@ function validateCookiePath (path) {
 }
 
 /**
- * I have no idea why these values aren't allowed to be honest,
- * but Deno tests these. - Khafra
+ * <let-dig> ::= <letter> | <digit>
+ *
+ * <letter> ::= any one of the 52 alphabetic characters A through Z in
+ * upper case and a through z in lower case
+ *
+ * <digit> ::= any one of the ten digits 0 through 9r
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @param {number} code
+ */
+function isLetterOrDigit (code) {
+  return (
+    (code >= 0x30 && code <= 0x39) || // 0-9
+    (code >= 0x41 && code <= 0x5A) || // A-Z
+    (code >= 0x61 && code <= 0x7A) // a-z
+  )
+}
+
+/**
+ * Validates a cookie domain against the "preferred name syntax".
+ *
+ * <domain>      ::= <subdomain> | " "
+ * <subdomain>   ::= <label> | <subdomain> "." <label>
+ * <label>       ::= <let-dig> [ [ <ldh-str> ] <let-dig> ]
+ * <ldh-str>     ::= <let-dig-hyp> | <let-dig-hyp> <ldh-str>
+ * <let-dig-hyp> ::= <let-dig> | "-"
+ *
+ * @see https://www.rfc-editor.org/rfc/rfc1034#section-3.5
+ * @see https://www.rfc-editor.org/rfc/rfc1123#section-2.1
+ * @see https://www.rfc-editor.org/rfc/rfc1035#section-2.3.4
  * @param {string} domain
  */
 function validateCookieDomain (domain) {
-  if (
-    domain.startsWith('-') ||
-    domain.endsWith('.') ||
-    domain.endsWith('-')
-  ) {
+  // <domain> ::= <subdomain> | " "
+  if (domain === ' ') {
+    return
+  }
+
+  if (domain.length > 255) {
+    throw new Error('Invalid cookie domain')
+  }
+
+  let labelLength = 0
+
+  for (let i = 0; i < domain.length; ++i) {
+    const code = domain.charCodeAt(i)
+
+    if (code === 0x2E) {
+      if (labelLength === 0) {
+        throw new Error('Invalid cookie domain')
+      }
+
+      if (domain.charCodeAt(i - 1) === 0x2D) { // "-"
+        throw new Error('Invalid cookie domain')
+      }
+
+      labelLength = 0
+      continue
+    }
+
+    if (labelLength === 0 && !isLetterOrDigit(code)) {
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (!isLetterOrDigit(code) && code !== 0x2D) { // "-"
+      throw new Error('Invalid cookie domain')
+    }
+
+    if (++labelLength > 63) {
+      throw new Error('Invalid cookie domain')
+    }
+  }
+
+  if (labelLength === 0 || domain.charCodeAt(domain.length - 1) === 0x2D) { // "-"
     throw new Error('Invalid cookie domain')
   }
 }
@@ -16711,7 +16829,13 @@ function stringify (cookie) {
 
     const [key, ...value] = part.split('=')
 
-    out.push(`${key.trim()}=${value.join('=')}`)
+    const trimmedKey = key.trim()
+    const joinedValue = value.join('=')
+
+    validateCookieName(trimmedKey)
+    validateCookieValue(joinedValue)
+
+    out.push(`${trimmedKey}=${joinedValue}`)
   }
 
   return out.join('; ')
@@ -31593,6 +31717,7 @@ class Context {
         this.action = process.env.GITHUB_ACTION;
         this.actor = process.env.GITHUB_ACTOR;
         this.job = process.env.GITHUB_JOB;
+        this.runAttempt = parseInt(process.env.GITHUB_RUN_ATTEMPT, 10);
         this.runNumber = parseInt(process.env.GITHUB_RUN_NUMBER, 10);
         this.runId = parseInt(process.env.GITHUB_RUN_ID, 10);
         this.apiUrl = (_a = process.env.GITHUB_API_URL) !== null && _a !== void 0 ? _a : `https://api.github.com`;
@@ -32410,7 +32535,7 @@ class HttpClient {
         if (this._keepAlive && useProxy) {
             agent = this._proxyAgent;
         }
-        if (this._keepAlive && !useProxy) {
+        if (!useProxy) {
             agent = this._agent;
         }
         // if agent is already assigned use that agent.
@@ -32442,15 +32567,11 @@ class HttpClient {
             agent = tunnelAgent(agentOptions);
             this._proxyAgent = agent;
         }
-        // if reusing agent across request and tunneling agent isn't assigned create a new agent
-        if (this._keepAlive && !agent) {
+        // if tunneling agent isn't assigned create a new agent
+        if (!agent) {
             const options = { keepAlive: this._keepAlive, maxSockets };
             agent = usingSsl ? new https.Agent(options) : new http.Agent(options);
             this._agent = agent;
-        }
-        // if not using private agent and tunnel agent isn't setup then use global agent
-        if (!agent) {
-            agent = usingSsl ? https.globalAgent : http.globalAgent;
         }
         if (usingSsl && this._ignoreSslError) {
             // we don't want to set NODE_TLS_REJECT_UNAUTHORIZED=0 since that will affect request for entire process
@@ -32473,7 +32594,7 @@ class HttpClient {
         }
         const usingSsl = parsedUrl.protocol === 'https:';
         proxyAgent = new undici_1.ProxyAgent(Object.assign({ uri: proxyUrl.href, pipelining: !this._keepAlive ? 0 : 1 }, ((proxyUrl.username || proxyUrl.password) && {
-            token: `${proxyUrl.username}:${proxyUrl.password}`
+            token: `Basic ${Buffer.from(`${proxyUrl.username}:${proxyUrl.password}`).toString('base64')}`
         })));
         this._proxyAgentDispatcher = proxyAgent;
         if (usingSsl && this._ignoreSslError) {
@@ -32587,11 +32708,11 @@ function getProxyUrl(reqUrl) {
     })();
     if (proxyVar) {
         try {
-            return new URL(proxyVar);
+            return new DecodedURL(proxyVar);
         }
         catch (_a) {
             if (!proxyVar.startsWith('http://') && !proxyVar.startsWith('https://'))
-                return new URL(`http://${proxyVar}`);
+                return new DecodedURL(`http://${proxyVar}`);
         }
     }
     else {
@@ -32649,6 +32770,19 @@ function isLoopbackAddress(host) {
         hostLower.startsWith('127.') ||
         hostLower.startsWith('[::1]') ||
         hostLower.startsWith('[0:0:0:0:0:0:0:1]'));
+}
+class DecodedURL extends URL {
+    constructor(url, base) {
+        super(url, base);
+        this._decodedUsername = decodeURIComponent(super.username);
+        this._decodedPassword = decodeURIComponent(super.password);
+    }
+    get username() {
+        return this._decodedUsername;
+    }
+    get password() {
+        return this._decodedPassword;
+    }
 }
 //# sourceMappingURL=proxy.js.map
 
@@ -36778,7 +36912,7 @@ __export(dist_src_exports, {
 module.exports = __toCommonJS(dist_src_exports);
 
 // pkg/dist-src/version.js
-var VERSION = "10.2.0";
+var VERSION = "10.4.1";
 
 // pkg/dist-src/generated/endpoints.js
 var Endpoints = {
@@ -36905,6 +37039,9 @@ var Endpoints = {
       "GET /repos/{owner}/{repo}/actions/permissions/selected-actions"
     ],
     getArtifact: ["GET /repos/{owner}/{repo}/actions/artifacts/{artifact_id}"],
+    getCustomOidcSubClaimForRepo: [
+      "GET /repos/{owner}/{repo}/actions/oidc/customization/sub"
+    ],
     getEnvironmentPublicKey: [
       "GET /repositories/{repository_id}/environments/{environment_name}/secrets/public-key"
     ],
@@ -37057,6 +37194,9 @@ var Endpoints = {
     setCustomLabelsForSelfHostedRunnerForRepo: [
       "PUT /repos/{owner}/{repo}/actions/runners/{runner_id}/labels"
     ],
+    setCustomOidcSubClaimForRepo: [
+      "PUT /repos/{owner}/{repo}/actions/oidc/customization/sub"
+    ],
     setGithubActionsDefaultWorkflowPermissionsOrganization: [
       "PUT /orgs/{org}/actions/permissions/workflow"
     ],
@@ -37126,6 +37266,7 @@ var Endpoints = {
     listWatchersForRepo: ["GET /repos/{owner}/{repo}/subscribers"],
     markNotificationsAsRead: ["PUT /notifications"],
     markRepoNotificationsAsRead: ["PUT /repos/{owner}/{repo}/notifications"],
+    markThreadAsDone: ["DELETE /notifications/threads/{thread_id}"],
     markThreadAsRead: ["PATCH /notifications/threads/{thread_id}"],
     setRepoSubscription: ["PUT /repos/{owner}/{repo}/subscription"],
     setThreadSubscription: [
@@ -37402,10 +37543,10 @@ var Endpoints = {
     updateForAuthenticatedUser: ["PATCH /user/codespaces/{codespace_name}"]
   },
   copilot: {
-    addCopilotForBusinessSeatsForTeams: [
+    addCopilotSeatsForTeams: [
       "POST /orgs/{org}/copilot/billing/selected_teams"
     ],
-    addCopilotForBusinessSeatsForUsers: [
+    addCopilotSeatsForUsers: [
       "POST /orgs/{org}/copilot/billing/selected_users"
     ],
     cancelCopilotSeatAssignmentForTeams: [
@@ -37718,9 +37859,23 @@ var Endpoints = {
       }
     ]
   },
+  oidc: {
+    getOidcCustomSubTemplateForOrg: [
+      "GET /orgs/{org}/actions/oidc/customization/sub"
+    ],
+    updateOidcCustomSubTemplateForOrg: [
+      "PUT /orgs/{org}/actions/oidc/customization/sub"
+    ]
+  },
   orgs: {
     addSecurityManagerTeam: [
       "PUT /orgs/{org}/security-managers/teams/{team_slug}"
+    ],
+    assignTeamToOrgRole: [
+      "PUT /orgs/{org}/organization-roles/teams/{team_slug}/{role_id}"
+    ],
+    assignUserToOrgRole: [
+      "PUT /orgs/{org}/organization-roles/users/{username}/{role_id}"
     ],
     blockUser: ["PUT /orgs/{org}/blocks/{username}"],
     cancelInvitation: ["DELETE /orgs/{org}/invitations/{invitation_id}"],
@@ -37730,6 +37885,7 @@ var Endpoints = {
     convertMemberToOutsideCollaborator: [
       "PUT /orgs/{org}/outside_collaborators/{username}"
     ],
+    createCustomOrganizationRole: ["POST /orgs/{org}/organization-roles"],
     createInvitation: ["POST /orgs/{org}/invitations"],
     createOrUpdateCustomProperties: ["PATCH /orgs/{org}/properties/schema"],
     createOrUpdateCustomPropertiesValuesForRepos: [
@@ -37740,6 +37896,9 @@ var Endpoints = {
     ],
     createWebhook: ["POST /orgs/{org}/hooks"],
     delete: ["DELETE /orgs/{org}"],
+    deleteCustomOrganizationRole: [
+      "DELETE /orgs/{org}/organization-roles/{role_id}"
+    ],
     deleteWebhook: ["DELETE /orgs/{org}/hooks/{hook_id}"],
     enableOrDisableSecurityProductOnAllOrgRepos: [
       "POST /orgs/{org}/{security_product}/{enablement}"
@@ -37751,6 +37910,7 @@ var Endpoints = {
     ],
     getMembershipForAuthenticatedUser: ["GET /user/memberships/orgs/{org}"],
     getMembershipForUser: ["GET /orgs/{org}/memberships/{username}"],
+    getOrgRole: ["GET /orgs/{org}/organization-roles/{role_id}"],
     getWebhook: ["GET /orgs/{org}/hooks/{hook_id}"],
     getWebhookConfigForOrg: ["GET /orgs/{org}/hooks/{hook_id}/config"],
     getWebhookDelivery: [
@@ -37766,6 +37926,12 @@ var Endpoints = {
     listInvitationTeams: ["GET /orgs/{org}/invitations/{invitation_id}/teams"],
     listMembers: ["GET /orgs/{org}/members"],
     listMembershipsForAuthenticatedUser: ["GET /user/memberships/orgs"],
+    listOrgRoleTeams: ["GET /orgs/{org}/organization-roles/{role_id}/teams"],
+    listOrgRoleUsers: ["GET /orgs/{org}/organization-roles/{role_id}/users"],
+    listOrgRoles: ["GET /orgs/{org}/organization-roles"],
+    listOrganizationFineGrainedPermissions: [
+      "GET /orgs/{org}/organization-fine-grained-permissions"
+    ],
     listOutsideCollaborators: ["GET /orgs/{org}/outside_collaborators"],
     listPatGrantRepositories: [
       "GET /orgs/{org}/personal-access-tokens/{pat_id}/repositories"
@@ -37780,6 +37946,9 @@ var Endpoints = {
     listSecurityManagerTeams: ["GET /orgs/{org}/security-managers"],
     listWebhookDeliveries: ["GET /orgs/{org}/hooks/{hook_id}/deliveries"],
     listWebhooks: ["GET /orgs/{org}/hooks"],
+    patchCustomOrganizationRole: [
+      "PATCH /orgs/{org}/organization-roles/{role_id}"
+    ],
     pingWebhook: ["POST /orgs/{org}/hooks/{hook_id}/pings"],
     redeliverWebhookDelivery: [
       "POST /orgs/{org}/hooks/{hook_id}/deliveries/{delivery_id}/attempts"
@@ -37803,6 +37972,18 @@ var Endpoints = {
     ],
     reviewPatGrantRequestsInBulk: [
       "POST /orgs/{org}/personal-access-token-requests"
+    ],
+    revokeAllOrgRolesTeam: [
+      "DELETE /orgs/{org}/organization-roles/teams/{team_slug}"
+    ],
+    revokeAllOrgRolesUser: [
+      "DELETE /orgs/{org}/organization-roles/users/{username}"
+    ],
+    revokeOrgRoleTeam: [
+      "DELETE /orgs/{org}/organization-roles/teams/{team_slug}/{role_id}"
+    ],
+    revokeOrgRoleUser: [
+      "DELETE /orgs/{org}/organization-roles/users/{username}/{role_id}"
     ],
     setMembershipForUser: ["PUT /orgs/{org}/memberships/{username}"],
     setPublicMembershipForAuthenticatedUser: [
@@ -38094,6 +38275,9 @@ var Endpoints = {
       {},
       { mapToData: "users" }
     ],
+    cancelPagesDeployment: [
+      "POST /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}/cancel"
+    ],
     checkAutomatedSecurityFixes: [
       "GET /repos/{owner}/{repo}/automated-security-fixes"
     ],
@@ -38129,12 +38313,15 @@ var Endpoints = {
     createForAuthenticatedUser: ["POST /user/repos"],
     createFork: ["POST /repos/{owner}/{repo}/forks"],
     createInOrg: ["POST /orgs/{org}/repos"],
+    createOrUpdateCustomPropertiesValues: [
+      "PATCH /repos/{owner}/{repo}/properties/values"
+    ],
     createOrUpdateEnvironment: [
       "PUT /repos/{owner}/{repo}/environments/{environment_name}"
     ],
     createOrUpdateFileContents: ["PUT /repos/{owner}/{repo}/contents/{path}"],
     createOrgRuleset: ["POST /orgs/{org}/rulesets"],
-    createPagesDeployment: ["POST /repos/{owner}/{repo}/pages/deployment"],
+    createPagesDeployment: ["POST /repos/{owner}/{repo}/pages/deployments"],
     createPagesSite: ["POST /repos/{owner}/{repo}/pages"],
     createRelease: ["POST /repos/{owner}/{repo}/releases"],
     createRepoRuleset: ["POST /repos/{owner}/{repo}/rulesets"],
@@ -38287,6 +38474,9 @@ var Endpoints = {
     getOrgRulesets: ["GET /orgs/{org}/rulesets"],
     getPages: ["GET /repos/{owner}/{repo}/pages"],
     getPagesBuild: ["GET /repos/{owner}/{repo}/pages/builds/{build_id}"],
+    getPagesDeployment: [
+      "GET /repos/{owner}/{repo}/pages/deployments/{pages_deployment_id}"
+    ],
     getPagesHealthCheck: ["GET /repos/{owner}/{repo}/pages/health"],
     getParticipationStats: ["GET /repos/{owner}/{repo}/stats/participation"],
     getPullRequestReviewProtection: [
@@ -38497,6 +38687,9 @@ var Endpoints = {
     ]
   },
   securityAdvisories: {
+    createFork: [
+      "POST /repos/{owner}/{repo}/security-advisories/{ghsa_id}/forks"
+    ],
     createPrivateVulnerabilityReport: [
       "POST /repos/{owner}/{repo}/security-advisories/reports"
     ],
@@ -72511,46 +72704,8 @@ module.exports = parseParams
 /***/ ((__unused_webpack_module, exports, __nccwpck_require__) => {
 
 "use strict";
-
-
-var packageurlJs = __nccwpck_require__(8915);
-var a = __nccwpck_require__(6491);
-var i = __nccwpck_require__(5438);
-var requestError = __nccwpck_require__(537);
-
-function _interopNamespace(e) {
-	if (e && e.__esModule) return e;
-	var n = Object.create(null);
-	if (e) {
-		Object.keys(e).forEach(function (k) {
-			if (k !== 'default') {
-				var d = Object.getOwnPropertyDescriptor(e, k);
-				Object.defineProperty(n, k, d.get ? d : {
-					enumerable: true,
-					get: function () { return e[k]; }
-				});
-			}
-		});
-	}
-	n.default = e;
-	return Object.freeze(n);
-}
-
-var a__namespace = /*#__PURE__*/_interopNamespace(a);
-var i__namespace = /*#__PURE__*/_interopNamespace(i);
-
-var o=class{depPackage;relationship;scope;constructor(e,t,s){this.depPackage=e,t!==void 0&&(this.relationship=t),s!==void 0&&(this.scope=s);}toJSON(){return {package_url:this.depPackage.packageURL.toString(),relationship:this.relationship,scope:this.scope,dependencies:this.depPackage.packageDependencyIDs}}},g=class{resolved;name;file;constructor(e,t){this.resolved={},this.name=e,t&&(this.file={source_location:t});}addDirectDependency(e,t){this.resolved[e.packageID()]=new o(e,"direct",t);}addIndirectDependency(e,t){this.resolved[e.packageID()]??=new o(e,"indirect",t);}hasDependency(e){return this.lookupDependency(e)!==void 0}lookupDependency(e){return this.resolved[e.packageID()]}countDependencies(){return Object.keys(this.resolved).length}filterDependencies(e){return Object.values(this.resolved).reduce((t,s)=>(e(s)&&t.push(s.depPackage),t),[])}directDependencies(){return this.filterDependencies(e=>e.relationship==="direct")}indirectDependencies(){return this.filterDependencies(e=>e.relationship==="indirect")}},u=class extends g{addBuildDependency(e){this.addDirectDependency(e,"runtime");for(let t of e.dependencies)this.addIndirectDependency(t,"runtime");}};var c=class{packageURL;dependencies;constructor(e){typeof e=="string"?this.packageURL=packageurlJs.PackageURL.fromString(e):this.packageURL=e,this.dependencies=[];}dependsOn(e){return this.dependencies.push(e),this}dependsOnPackages(e){for(let t of e)this.dependsOn(t);return this}get packageDependencyIDs(){return this.dependencies.map(e=>e.packageID())}packageID(){return this.packageURL.toString()}namespace(){return this.packageURL.namespace??null}name(){return this.packageURL.name}version(){return this.packageURL.version||""}matching(e){return (e.namespace===void 0||this.packageURL.namespace===e.namespace)&&(e.name===void 0||this.packageURL.name===e.name)&&(e.version===void 0||this.packageURL.version===e.version)}};var h=class{database;constructor(){this.database={};}package(e){let t=this.lookupPackage(e);if(t)return t;let s=new c(e);return this.addPackage(s),s}packagesMatching(e){return Object.values(this.database).filter(t=>t.matching(e))}addPackage(e){this.database[e.packageURL.toString()]=e;}removePackage(e){delete this.database[e.packageURL.toString()];}lookupPackage(e){if(typeof e=="string"){let t=packageurlJs.PackageURL.fromString(e);return this.database[t.toString()]}return this.database[e.toString()]}hasPackage(e){return this.lookupPackage(e)!==void 0}countPackages(){return Object.values(this.database).length}};function y(r){return {correlator:r.job,id:r.runId.toString()}}function P(r){return ["pull_request","pull_request_comment","pull_request_review","pull_request_review_comment"].includes(r.eventName)?r.payload.pull_request.head.sha:r.sha}var l=class{manifests;version;job;sha;ref;scanned;detector;constructor(e,t=i__namespace.context,s,p=new Date,n=0){this.detector=e,this.version=n,this.job=s||y(t),this.sha=P(t),this.ref=t.ref,this.scanned=p.toISOString(),this.manifests={};}addManifest(e){this.manifests[e.name]=e;}prettyJSON(){return JSON.stringify(this,void 0,4)}};async function L(r,e=i__namespace.context){a__namespace.setOutput("snapshot",JSON.stringify(r)),a__namespace.notice("Submitting snapshot..."),a__namespace.notice(r.prettyJSON());let t=e.repo,s=a__namespace.getInput("token")||await a__namespace.getIDToken(),p=i__namespace.getOctokit(s);try{let n=await p.request("POST /repos/{owner}/{repo}/dependency-graph/snapshots",{headers:{accept:"application/vnd.github.foo-bar-preview+json"},owner:t.owner,repo:t.repo,...r}),d=n.data.result;d==="SUCCESS"||d==="ACCEPTED"?a__namespace.notice(`Snapshot successfully created at ${n.data.created_at.toString()}`):a__namespace.error(`Snapshot creation failed with result: "${d}: ${n.data.message}"`);}catch(n){throw n instanceof requestError.RequestError&&(a__namespace.error(`HTTP Status ${n.status} for request ${n.request.method} ${n.request.url}`),n.response&&a__namespace.error(`Response body:
-${JSON.stringify(n.response.data,void 0,2)}`)),n instanceof Error&&(a__namespace.error(n.message),n.stack&&a__namespace.error(n.stack)),new Error(`Failed to submit snapshot: ${n}`)}}
-
-exports.BuildTarget = u;
-exports.Manifest = g;
-exports.Package = c;
-exports.PackageCache = h;
-exports.Snapshot = l;
-exports.jobFromContext = y;
-exports.shaFromContext = P;
-exports.submitSnapshot = L;
-//# sourceMappingURL=out.js.map
+var packageurlJs=__nccwpck_require__(8915),a=__nccwpck_require__(6491),i=__nccwpck_require__(5438),requestError=__nccwpck_require__(2768);function _interopNamespace(e){if(e&&e.__esModule)return e;var n=Object.create(null);if(e){Object.keys(e).forEach(function(k){if(k!=='default'){var d=Object.getOwnPropertyDescriptor(e,k);Object.defineProperty(n,k,d.get?d:{enumerable:true,get:function(){return e[k]}});}})}n.default=e;return Object.freeze(n)}var a__namespace=/*#__PURE__*/_interopNamespace(a);var i__namespace=/*#__PURE__*/_interopNamespace(i);var o=class{depPackage;relationship;scope;constructor(e,t,s){this.depPackage=e,t!==void 0&&(this.relationship=t),s!==void 0&&(this.scope=s);}toJSON(){return {package_url:this.depPackage.packageURL.toString(),relationship:this.relationship,scope:this.scope,dependencies:this.depPackage.packageDependencyIDs}}},g=class{resolved;name;file;constructor(e,t){this.resolved={},this.name=e,t&&(this.file={source_location:t});}addDirectDependency(e,t){this.resolved[e.packageID()]=new o(e,"direct",t);}addIndirectDependency(e,t){this.resolved[e.packageID()]??=new o(e,"indirect",t);}hasDependency(e){return this.lookupDependency(e)!==void 0}lookupDependency(e){return this.resolved[e.packageID()]}countDependencies(){return Object.keys(this.resolved).length}filterDependencies(e){return Object.values(this.resolved).reduce((t,s)=>(e(s)&&t.push(s.depPackage),t),[])}directDependencies(){return this.filterDependencies(e=>e.relationship==="direct")}indirectDependencies(){return this.filterDependencies(e=>e.relationship==="indirect")}},u=class extends g{addBuildDependency(e){this.addDirectDependency(e,"runtime");for(let t of e.dependencies)this.addIndirectDependency(t,"runtime");}};var c=class{packageURL;dependencies;constructor(e){typeof e=="string"?this.packageURL=packageurlJs.PackageURL.fromString(e):this.packageURL=e,this.dependencies=[];}dependsOn(e){return this.dependencies.push(e),this}dependsOnPackages(e){for(let t of e)this.dependsOn(t);return this}get packageDependencyIDs(){return this.dependencies.map(e=>e.packageID())}packageID(){return this.packageURL.toString()}namespace(){return this.packageURL.namespace??null}name(){return this.packageURL.name}version(){return this.packageURL.version||""}matching(e){return (e.namespace===void 0||this.packageURL.namespace===e.namespace)&&(e.name===void 0||this.packageURL.name===e.name)&&(e.version===void 0||this.packageURL.version===e.version)}};var h=class{database;constructor(){this.database={};}package(e){let t=this.lookupPackage(e);if(t)return t;let s=new c(e);return this.addPackage(s),s}packagesMatching(e){return Object.values(this.database).filter(t=>t.matching(e))}addPackage(e){this.database[e.packageURL.toString()]=e;}removePackage(e){delete this.database[e.packageURL.toString()];}lookupPackage(e){if(typeof e=="string"){let t=packageurlJs.PackageURL.fromString(e);return this.database[t.toString()]}return this.database[e.toString()]}hasPackage(e){return this.lookupPackage(e)!==void 0}countPackages(){return Object.values(this.database).length}};function y(r){return {correlator:r.job,id:r.runId.toString()}}function P(r){return ["pull_request","pull_request_comment","pull_request_review","pull_request_review_comment"].includes(r.eventName)?r.payload.pull_request.head.sha:r.sha}var l=class{manifests;version;job;sha;ref;scanned;detector;constructor(e,t=i__namespace.context,s,p=new Date,n=0){this.detector=e,this.version=n,this.job=s||y(t),this.sha=P(t),this.ref=t.ref,this.scanned=p.toISOString(),this.manifests={};}addManifest(e){this.manifests[e.name]=e;}prettyJSON(){return JSON.stringify(this,void 0,4)}};async function L(r,e=i__namespace.context){a__namespace.setOutput("snapshot",JSON.stringify(r)),a__namespace.notice("Submitting snapshot..."),a__namespace.notice(r.prettyJSON());let t=e.repo,s=a__namespace.getInput("token")||await a__namespace.getIDToken(),p=i__namespace.getOctokit(s);try{let n=await p.request("POST /repos/{owner}/{repo}/dependency-graph/snapshots",{headers:{accept:"application/vnd.github.foo-bar-preview+json"},owner:t.owner,repo:t.repo,...r}),d=n.data.result;d==="SUCCESS"||d==="ACCEPTED"?a__namespace.notice(`Snapshot successfully created at ${n.data.created_at.toString()}`):a__namespace.error(`Snapshot creation failed with result: "${d}: ${n.data.message}"`);}catch(n){throw n instanceof requestError.RequestError&&(a__namespace.error(`HTTP Status ${n.status} for request ${n.request.method} ${n.request.url}`),n.response&&a__namespace.error(`Response body:
+${JSON.stringify(n.response.data,void 0,2)}`)),n instanceof Error&&(a__namespace.error(n.message),n.stack&&a__namespace.error(n.stack)),new Error(`Failed to submit snapshot: ${n}`)}}exports.BuildTarget=u;exports.Manifest=g;exports.Package=c;exports.PackageCache=h;exports.Snapshot=l;exports.jobFromContext=y;exports.shaFromContext=P;exports.submitSnapshot=L;//# sourceMappingURL=index.cjs.map
 //# sourceMappingURL=index.cjs.map
 
 /***/ }),
@@ -78559,6 +78714,56 @@ module.exports = axios;
 
 /***/ }),
 
+/***/ 2768:
+/***/ ((__unused_webpack___webpack_module__, __webpack_exports__, __nccwpck_require__) => {
+
+"use strict";
+__nccwpck_require__.r(__webpack_exports__);
+/* harmony export */ __nccwpck_require__.d(__webpack_exports__, {
+/* harmony export */   "RequestError": () => (/* binding */ RequestError)
+/* harmony export */ });
+class RequestError extends Error {
+  name;
+  /**
+   * http status code
+   */
+  status;
+  /**
+   * Request options that lead to the error.
+   */
+  request;
+  /**
+   * Response object if a response was received
+   */
+  response;
+  constructor(message, statusCode, options) {
+    super(message);
+    this.name = "HttpError";
+    this.status = Number.parseInt(statusCode);
+    if (Number.isNaN(this.status)) {
+      this.status = 0;
+    }
+    if ("response" in options) {
+      this.response = options.response;
+    }
+    const requestCopy = Object.assign({}, options.request);
+    if (options.request.headers.authorization) {
+      requestCopy.headers = Object.assign({}, options.request.headers, {
+        authorization: options.request.headers.authorization.replace(
+          /(?<! ) .*$/,
+          " [REDACTED]"
+        )
+      });
+    }
+    requestCopy.url = requestCopy.url.replace(/\bclient_secret=\w+/g, "client_secret=[REDACTED]").replace(/\baccess_token=\w+/g, "access_token=[REDACTED]");
+    this.request = requestCopy;
+  }
+}
+
+
+
+/***/ }),
+
 /***/ 3765:
 /***/ ((module) => {
 
@@ -78600,6 +78805,34 @@ module.exports = JSON.parse('{"application/1d-interleaved-parityfec":{"source":"
 /******/ 	}
 /******/ 	
 /************************************************************************/
+/******/ 	/* webpack/runtime/define property getters */
+/******/ 	(() => {
+/******/ 		// define getter functions for harmony exports
+/******/ 		__nccwpck_require__.d = (exports, definition) => {
+/******/ 			for(var key in definition) {
+/******/ 				if(__nccwpck_require__.o(definition, key) && !__nccwpck_require__.o(exports, key)) {
+/******/ 					Object.defineProperty(exports, key, { enumerable: true, get: definition[key] });
+/******/ 				}
+/******/ 			}
+/******/ 		};
+/******/ 	})();
+/******/ 	
+/******/ 	/* webpack/runtime/hasOwnProperty shorthand */
+/******/ 	(() => {
+/******/ 		__nccwpck_require__.o = (obj, prop) => (Object.prototype.hasOwnProperty.call(obj, prop))
+/******/ 	})();
+/******/ 	
+/******/ 	/* webpack/runtime/make namespace object */
+/******/ 	(() => {
+/******/ 		// define __esModule on exports
+/******/ 		__nccwpck_require__.r = (exports) => {
+/******/ 			if(typeof Symbol !== 'undefined' && Symbol.toStringTag) {
+/******/ 				Object.defineProperty(exports, Symbol.toStringTag, { value: 'Module' });
+/******/ 			}
+/******/ 			Object.defineProperty(exports, '__esModule', { value: true });
+/******/ 		};
+/******/ 	})();
+/******/ 	
 /******/ 	/* webpack/runtime/compat */
 /******/ 	
 /******/ 	if (typeof __nccwpck_require__ !== 'undefined') __nccwpck_require__.ab = __dirname + "/";
